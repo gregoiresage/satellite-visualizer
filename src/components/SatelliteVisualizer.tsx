@@ -5,7 +5,18 @@ import { coalesceToArray } from 'utilities';
 import { css, cx } from '@emotion/css';
 import { useStyles2 } from '@grafana/ui';
 
-import { Viewer, Clock, Entity, PointGraphics, ModelGraphics, PathGraphics, LabelGraphics } from 'resium';
+import {
+  Viewer,
+  Clock,
+  Entity,
+  PointGraphics,
+  ModelGraphics,
+  PathGraphics,
+  LabelGraphics,
+  Sun,
+  Globe,
+  ImageryLayer,
+} from 'resium';
 import {
   Ion,
   JulianDate,
@@ -21,6 +32,8 @@ import {
   IonResource,
   Cartesian2,
   Matrix3,
+  ArcGisMapServerImageryProvider,
+  ArcGisBaseMapType,
 } from 'cesium';
 
 import 'cesium/Build/Cesium/Widgets/widgets.css';
@@ -63,8 +76,8 @@ export const SatelliteVisualizer: React.FC<Props> = ({ options, data, timeRange,
 
   const [timestamp, setTimestamp] = useState<JulianDate | null>(null);
   const [satelliteAvailability, setSatelliteAvailability] = useState<TimeIntervalCollection | null>(null);
-  const [satellitePosition, setSatellitePosition] = useState<SampledPositionProperty | null>(null);
-  const [satelliteOrientation, setSatelliteOrientation] = useState<SampledProperty | null>(null);
+  const [satellitePosition, setSatellitePosition] = useState<SampledPositionProperty[]>([]);
+  const [satelliteOrientation, setSatelliteOrientation] = useState<SampledProperty[]>([]);
 
   const [satelliteResource, setSatelliteResource] = useState<IonResource | string | undefined>(undefined);
 
@@ -86,7 +99,7 @@ export const SatelliteVisualizer: React.FC<Props> = ({ options, data, timeRange,
     if (data.series.length === 1) {
       const dataFrame = data.series[0];
 
-      if (dataFrame.fields.length !== 8) {
+      if (dataFrame.fields.length < 8 && (dataFrame.fields.length - 1) % 7 !== 0) {
         throw new Error(`Invalid number of fields [${dataFrame.fields.length}] in data frame.`);
       }
 
@@ -114,61 +127,68 @@ export const SatelliteVisualizer: React.FC<Props> = ({ options, data, timeRange,
         setSatelliteAvailability(null);
       }
 
-      const positionProperty = new SampledPositionProperty();
-      const orientationProperty = new SampledProperty(Quaternion);
+      const positions = [];
+      const orientations = [];
 
-      for (let i = 0; i < dataFrame.fields[1].values.length; i++) {
-        const time = JulianDate.fromDate(new Date(coalesceToArray(dataFrame.fields[0].values)[i]));
+      for (let n = 1; n < dataFrame.fields.length; n += 7) {
+        const positionProperty = new SampledPositionProperty();
+        const orientationProperty = new SampledProperty(Quaternion);
+        for (let i = 0; i < dataFrame.fields[1].values.length; i++) {
+          const time = JulianDate.fromDate(new Date(coalesceToArray(dataFrame.fields[0].values)[i]));
 
-        const DCM_ECI_ECEF = Transforms.computeFixedToIcrfMatrix(time);
+          const DCM_ECI_ECEF = Transforms.computeFixedToIcrfMatrix(time)!;
 
-        let x_ECEF: Cartesian3;
-        switch (options.coordinatesType) {
-          case CoordinatesType.CartesianFixed:
-            x_ECEF = new Cartesian3(
-              coalesceToArray(dataFrame.fields[1].values)[i],
-              coalesceToArray(dataFrame.fields[2].values)[i],
-              coalesceToArray(dataFrame.fields[3].values)[i]
-            );
-            break;
-          case CoordinatesType.CartesianInertial:
-            x_ECEF = Matrix3.multiplyByVector(
-              Matrix3.transpose(DCM_ECI_ECEF, new Matrix3()),
-              new Cartesian3(
+          let x_ECEF: Cartesian3;
+          switch (options.coordinatesType) {
+            case CoordinatesType.CartesianFixed:
+              x_ECEF = new Cartesian3(
                 coalesceToArray(dataFrame.fields[1].values)[i],
                 coalesceToArray(dataFrame.fields[2].values)[i],
                 coalesceToArray(dataFrame.fields[3].values)[i]
-              ),
-              new Cartesian3()
-            );
-            break;
-          default:
-            x_ECEF = Cartesian3.fromDegrees(
-              coalesceToArray(dataFrame.fields[1].values)[i],
-              coalesceToArray(dataFrame.fields[2].values)[i],
-              coalesceToArray(dataFrame.fields[3].values)[i]
-            );
-            break;
+              );
+              break;
+            case CoordinatesType.CartesianInertial:
+              x_ECEF = Matrix3.multiplyByVector(
+                Matrix3.transpose(DCM_ECI_ECEF, new Matrix3()),
+                new Cartesian3(
+                  coalesceToArray(dataFrame.fields[1].values)[i],
+                  coalesceToArray(dataFrame.fields[2].values)[i],
+                  coalesceToArray(dataFrame.fields[3].values)[i]
+                ),
+                new Cartesian3()
+              );
+              break;
+            default:
+              x_ECEF = Cartesian3.fromDegrees(
+                coalesceToArray(dataFrame.fields[1].values)[i],
+                coalesceToArray(dataFrame.fields[2].values)[i],
+                coalesceToArray(dataFrame.fields[3].values)[i]
+              );
+              break;
+          }
+
+          const q_B_ECI = new Quaternion(
+            coalesceToArray(dataFrame.fields[4].values)[i],
+            coalesceToArray(dataFrame.fields[5].values)[i],
+            coalesceToArray(dataFrame.fields[6].values)[i],
+            coalesceToArray(dataFrame.fields[7].values)[i]
+          );
+
+          positionProperty.addSample(time, x_ECEF);
+
+          const q_ECI_ECEF = Quaternion.fromRotationMatrix(DCM_ECI_ECEF);
+          const q_ECEF_ECI = Quaternion.conjugate(q_ECI_ECEF, new Quaternion());
+          const q_B_ECEF = Quaternion.multiply(q_ECEF_ECI, q_B_ECI, new Quaternion());
+
+          orientationProperty.addSample(time, q_B_ECEF);
         }
 
-        const q_B_ECI = new Quaternion(
-          coalesceToArray(dataFrame.fields[4].values)[i],
-          coalesceToArray(dataFrame.fields[5].values)[i],
-          coalesceToArray(dataFrame.fields[6].values)[i],
-          coalesceToArray(dataFrame.fields[7].values)[i]
-        );
-
-        positionProperty.addSample(time, x_ECEF);
-
-        const q_ECI_ECEF = Quaternion.fromRotationMatrix(DCM_ECI_ECEF);
-        const q_ECEF_ECI = Quaternion.conjugate(q_ECI_ECEF, new Quaternion());
-        const q_B_ECEF = Quaternion.multiply(q_ECEF_ECI, q_B_ECI, new Quaternion());
-
-        orientationProperty.addSample(time, q_B_ECEF);
+        positions.push(positionProperty);
+        orientations.push(orientationProperty);
       }
 
-      setSatellitePosition(positionProperty);
-      setSatelliteOrientation(orientationProperty);
+      setSatellitePosition(positions);
+      setSatelliteOrientation(orientations);
     }
   }, [data, options, isLoaded]);
 
@@ -243,37 +263,48 @@ export const SatelliteVisualizer: React.FC<Props> = ({ options, data, timeRange,
         creditContainer="cesium-credits"
       >
         {timestamp && <Clock currentTime={timestamp} />}
-        {satelliteAvailability && satellitePosition && satelliteOrientation && (
-          <Entity
-            availability={satelliteAvailability}
-            position={satellitePosition}
-            orientation={satelliteOrientation}
-            tracked={true}
-          >
-            {options.assetMode === AssetMode.Point && (
-              <PointGraphics pixelSize={options.pointSize} color={Color.fromCssColorString(options.pointColor)} />
-            )}
-            {options.assetMode === AssetMode.Model && satelliteResource && (
-              <ModelGraphics
-                uri={satelliteResource}
-                scale={options.modelScale}
-                minimumPixelSize={options.modelMinimumPixelSize}
-                maximumScale={options.modelMaximumScale}
-              />
-            )}
-            {options.trajectoryShow && (
-              <PathGraphics
-                width={options.trajectoryWidth}
-                material={
-                  new PolylineDashMaterialProperty({
-                    color: Color.fromCssColorString(options.trajectoryColor),
-                    dashLength: options.trajectoryDashLength,
-                  })
-                }
-              />
-            )}
-          </Entity>
-        )}
+        <Sun />
+        <Globe enableLighting />
+        <ImageryLayer
+          imageryProvider={ArcGisMapServerImageryProvider.fromBasemapType(ArcGisBaseMapType.SATELLITE, {
+            enablePickFeatures: false,
+          })}
+        />
+        {satelliteAvailability &&
+          satellitePosition.map((__, i) => {
+            return (
+              <Entity
+                key={'entity-' + i}
+                availability={satelliteAvailability}
+                position={satellitePosition[i]}
+                orientation={satelliteOrientation[i]}
+                tracked={true}
+              >
+                {options.assetMode === AssetMode.Point && (
+                  <PointGraphics pixelSize={options.pointSize} color={Color.fromCssColorString(options.pointColor)} />
+                )}
+                {options.assetMode === AssetMode.Model && satelliteResource && (
+                  <ModelGraphics
+                    uri={satelliteResource}
+                    scale={options.modelScale}
+                    minimumPixelSize={options.modelMinimumPixelSize}
+                    maximumScale={options.modelMaximumScale}
+                  />
+                )}
+                {options.trajectoryShow && (
+                  <PathGraphics
+                    width={options.trajectoryWidth}
+                    material={
+                      new PolylineDashMaterialProperty({
+                        color: Color.fromCssColorString(options.trajectoryColor),
+                        dashLength: options.trajectoryDashLength,
+                      })
+                    }
+                  />
+                )}
+              </Entity>
+            );
+          })}
         {options.locations.map((location, index) => (
           <Entity
             name={location.name}
